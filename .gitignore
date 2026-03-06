@@ -1,0 +1,29 @@
+# Vivado project files (too large for git)
+hw/
+sw/
+sdt_output/
+sdt_output2/
+
+# Vitis workspace
+vitis_ws/
+vitis_workspace/
+vitis_home/
+vitis_appdata/
+
+# Temp
+temp/
+*.log
+*.jou
+.Xil/
+
+# Downloaded zips
+*.zip
+
+# Generated files
+hdmi_wrapper.xsa
+hdmi_final.bit
+vivado*.log
+vivado*.jou
+
+# Executables
+putty.exe
