@@ -147,6 +147,18 @@ NexysVideo-HDMI/
 - [GitHub Release (HDMI/2024.1-1)](https://github.com/Digilent/Nexys-Video/releases)
 - [Nexys Video Reference Manual](https://digilent.com/reference/programmable-logic/nexys-video/reference-manual)
 
+## Ek Scriptler
+
+| Script | Açıklama |
+|---|---|
+| `07_uart_check.py` | COM3 üzerinden UART menüsünü okur, HDMI durumunu gösterir |
+| `08_program_and_run.py` | Bitstream + ELF'i tek komutla yükler (Türkçe karakter sorununu otomatik çözer) |
+| `09_find_tinkerboard.py` | Ağda Tinkerboard'u SSH port taramasıyla bulur |
+
+## İlerleme Raporu
+
+Detaylı ilerleme, karşılaşılan sorunlar ve çözüm önerileri için bkz: [ILERLEME.md](ILERLEME.md)
+
 ## Lisans
 
 Orijinal demo Digilent tarafından sağlanmıştır. Bu repo sadece 2025.2 uyarlama scriptlerini içerir.
