@@ -12,7 +12,7 @@ stop
 after 500
 
 # Download ELF
-dow {C:/NexysVideo-HDMI/sw/Nexys-Video-HDMI/Debug/Nexys-Video-HDMI.elf}
+dow {C:/temp_fpga/Nexys-Video-HDMI.elf}
 puts "=== ELF DOWNLOADED ==="
 
 # Run

@@ -23,6 +23,7 @@ class FPGAControlPanel:
         self.lock = threading.Lock()
         self.connected = False
         self.stream_active = False
+        self.invert_loop_active = False
 
         self.current_resolution = tk.StringVar(value="---")
         self.current_capture = tk.StringVar(value="---")
@@ -215,11 +216,18 @@ class FPGAControlPanel:
 
     def _set_resolution(self, res_id):
         def task():
+            was_inverting = self.invert_loop_active
+            if was_inverting:
+                self.invert_loop_active = False
+                time.sleep(4)  # invert dongusunun durmasini bekle
             self._send_command('1', wait=1.5)
             resp = self._send_command(res_id, wait=3)
             if resp:
                 self.root.after(0, lambda: self._parse_status(resp))
                 self.root.after(0, lambda: self._set_status("Cozunurluk degistirildi"))
+            if was_inverting:
+                # Ters renk akisini tekrar baslat
+                self.root.after(100, self._invert_colors)
         self._run(task)
 
     def _toggle_stream(self):
@@ -232,29 +240,85 @@ class FPGAControlPanel:
             self.root.after(0, lambda: self._set_status(s))
         self._run(task)
 
-    def _restart_stream(self):
-        if self.stream_active:
-            self._send_command('5', wait=1)
-            time.sleep(0.3)
-        self._send_command('5', wait=1)
+    def _align_framebuffers(self):
+        """Display ve Video framebuffer'lari esitler (ikisini de 0 yapar)"""
+        # Mevcut durumu oku
+        resp = self._send_command('\r', wait=1)
+        if not resp:
+            return
+        display_fb = 0
+        video_fb = 0
+        for line in resp.split('\n'):
+            line = line.strip().strip('*')
+            if 'Display Frame Index:' in line:
+                try:
+                    display_fb = int(line.split(':', 1)[1].strip())
+                except:
+                    pass
+            elif 'Video Frame Index:' in line:
+                try:
+                    video_fb = int(line.split(':', 1)[1].strip())
+                except:
+                    pass
+        # Display FB'yi video FB ile ayni yap (0'a getir)
+        # FB 0->1->2->0 dongusu, display_fb kadar 2 ile ilerle
+        if display_fb != video_fb:
+            clicks = (3 - display_fb + video_fb) % 3
+            for _ in range(clicks):
+                self._send_command('2', wait=1)
+
+    def _restart_stream_safe(self):
+        """Stream'i durdur, framebuffer'lari hizala, tekrar baslat"""
+        # Once stream'i durdur (eger aktifse)
+        self._send_command('5', wait=1.5)
+        time.sleep(0.3)
+        # Framebuffer'lari hizala
+        self._align_framebuffers()
+        # Stream'i baslat
+        self._send_command('5', wait=1.5)
         self.stream_active = True
 
     def _invert_colors(self):
+        if self.invert_loop_active:
+            self.invert_loop_active = False
+            return
         def task():
-            self._send_command('7', wait=2)
-            self._restart_stream()
-            self.root.after(0, lambda: self._set_status("Renkler cevrildi + stream basladi"))
-            resp = self._send_command('\r', wait=1)
+            self.invert_loop_active = True
+            # Once stream'i durdur (cakismasin)
+            self._send_command('5', wait=1)
+            self.stream_active = False
+            self.root.after(0, lambda: self._set_status("Ters renk akisi aktif (~1 fps) - durdurmak icin tekrar tikla"))
+            with self.lock:
+                try:
+                    while self.invert_loop_active and self.connected and self.ser:
+                        self.ser.reset_input_buffer()
+                        self.ser.write(b'7')
+                        # MicroBlaze'in islemi bitirmesini bekle
+                        deadline = time.time() + 5
+                        while self.invert_loop_active and time.time() < deadline:
+                            avail = self.ser.in_waiting
+                            if avail > 0:
+                                data = self.ser.read(avail)
+                                if b'Enter a selection' in data:
+                                    break
+                            time.sleep(0.02)
+                except Exception as e:
+                    self.root.after(0, lambda: self._set_status(f"Hata: {e}"))
+            # Durdurulunca: framebuffer esitle ve normal stream'e don
+            self._restart_stream_safe()
+            self.root.after(0, lambda: self._set_status("Normal stream'e donuldu"))
+            resp = self._send_command('\r', wait=1.5)
             if resp:
                 self.root.after(0, lambda: self._parse_status(resp))
         self._run(task)
 
     def _scale_frame(self):
         def task():
-            self._send_command('8', wait=2)
-            self._restart_stream()
+            self.root.after(0, lambda: self._set_status("Olcekleniyor... (yavas islem, bekleyin)"))
+            self._send_command('8', wait=15)
+            self._restart_stream_safe()
             self.root.after(0, lambda: self._set_status("Olceklendi + stream basladi"))
-            resp = self._send_command('\r', wait=1)
+            resp = self._send_command('\r', wait=1.5)
             if resp:
                 self.root.after(0, lambda: self._parse_status(resp))
         self._run(task)
