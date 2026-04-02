@@ -97,6 +97,7 @@ static int         st_num_stars = 0;
 static u16         st_stack_x[ST_STACK_SIZE];
 static u16         st_stack_y[ST_STACK_SIZE];
 static int         st_threshold = ST_THRESHOLD;
+static int         st_grayscale_valid = 0;  /* grayscale tablosu hazir mi */
 
 /* ------------------------------------------------------------ */
 /*           Star Tracker Fonksiyonlari                        */
@@ -393,6 +394,7 @@ void StarTracker_Run(void)
     /* Adim 1: Grayscale donusum */
     xil_printf("[Star Tracker] Adim 1: Framebuffer okunuyor...\r\n");
     StarTracker_ReadFrame(frame, width, height, stride);
+    st_grayscale_valid = 1;
     xil_printf("[Star Tracker] Adim 1: OK\r\n");
 
     /* Adim 2: Yildiz tespiti */
@@ -508,9 +510,125 @@ void StarTracker_GenerateStarfield(void)
     }
 
     Xil_DCacheFlushRange((unsigned int)frame, DEMO_MAX_FRAME);
+
+    /* Grayscale tablosunu doldur (LUT icin) */
+    StarTracker_ReadFrame(frame, width, height, stride);
+    st_grayscale_valid = 1;
+
     xil_printf("[Star Tracker] Yildiz alani olusturuldu! Monitorde gorunmeli.\r\n");
     xil_printf("[Star Tracker] Simdi '9' ile Star Tracker calistirabilirsiniz.\r\n");
 }
+
+/* ------------------------------------------------------------ */
+/*           False Color LUT Fonksiyonlari                     */
+/* ------------------------------------------------------------ */
+
+/*
+ * LUT modlari:
+ *   0 = Grayscale (orijinal)
+ *   1 = Heatmap (siyah->kirmizi->sari->beyaz)
+ *   2 = Rainbow (mavi->cyan->yesil->sari->kirmizi)
+ *   3 = Inverted (ters gri tonlama)
+ */
+static int st_lut_mode = 0;
+
+static void LUT_Grayscale(u8 val, u8 *r, u8 *g, u8 *b)
+{
+    *r = val; *g = val; *b = val;
+}
+
+static void LUT_Heatmap(u8 val, u8 *r, u8 *g, u8 *b)
+{
+    /* siyah -> kirmizi -> sari -> beyaz */
+    if (val < 85) {
+        *r = val * 3; *g = 0; *b = 0;
+    } else if (val < 170) {
+        *r = 255; *g = (val - 85) * 3; *b = 0;
+    } else {
+        *r = 255; *g = 255; *b = (val - 170) * 3;
+    }
+}
+
+static void LUT_Rainbow(u8 val, u8 *r, u8 *g, u8 *b)
+{
+    /* mavi -> cyan -> yesil -> sari -> kirmizi */
+    if (val < 64) {
+        *r = 0; *g = val * 4; *b = 255;
+    } else if (val < 128) {
+        *r = 0; *g = 255; *b = 255 - (val - 64) * 4;
+    } else if (val < 192) {
+        *r = (val - 128) * 4; *g = 255; *b = 0;
+    } else {
+        *r = 255; *g = 255 - (val - 192) * 4; *b = 0;
+    }
+}
+
+static void LUT_Inverted(u8 val, u8 *r, u8 *g, u8 *b)
+{
+    u8 v = 255 - val;
+    *r = v; *g = v; *b = v;
+}
+
+/*
+ * Mevcut framebuffer'a yerinde (in-place) LUT uygula
+ * Oncelikle grayscale'e cevrilir, sonra LUT ile renklendirilir
+ */
+void StarTracker_ApplyLUT(int mode)
+{
+    u8 *frame = pFrames[dispCtrl.curFrame];
+    u32 width = dispCtrl.vMode.width;
+    u32 height = dispCtrl.vMode.height;
+    u32 stride = DEMO_STRIDE;
+    u32 row, col;
+    u32 lineStart = 0;
+
+    const char *names[] = {"Grayscale", "Heatmap", "Rainbow", "Inverted"};
+    if (mode < 0 || mode > 3) mode = 0;
+    st_lut_mode = mode;
+
+    xil_printf("\r\n[False Color] %s uygulanıyor...\r\n", names[mode]);
+
+    /* Eger grayscale tablosu hazir degilse, once framebuffer'dan oku */
+    if (!st_grayscale_valid) {
+        xil_printf("[False Color] Grayscale tablosu olusturuluyor...\r\n");
+        StarTracker_ReadFrame(frame, width, height, stride);
+        st_grayscale_valid = 1;
+    }
+
+    for (row = 0; row < height && row < ST_MAX_HEIGHT; row++)
+    {
+        for (col = 0; col < width && col < ST_MAX_WIDTH; col++)
+        {
+            u32 idx = lineStart + col * 3;
+            /* Her zaman orijinal grayscale tablosundan oku */
+            u8 gray = st_grayscale[row][col];
+
+            u8 nr, ng, nb;
+            switch (mode) {
+                case 1:  LUT_Heatmap(gray, &nr, &ng, &nb); break;
+                case 2:  LUT_Rainbow(gray, &nr, &ng, &nb); break;
+                case 3:  LUT_Inverted(gray, &nr, &ng, &nb); break;
+                default: LUT_Grayscale(gray, &nr, &ng, &nb); break;
+            }
+
+            /* Gercek kanal sirasi: byte0=G, byte1=B, byte2=R */
+            frame[idx]     = ng;  /* G */
+            frame[idx + 1] = nb;  /* B */
+            frame[idx + 2] = nr;  /* R */
+        }
+        lineStart += stride;
+    }
+
+    /* Overlay'leri yeniden ciz (varsa) */
+    if (st_num_stars > 0) {
+        StarTracker_DrawOverlays(frame, width, stride);
+    }
+
+    Xil_DCacheFlushRange((unsigned int)frame, DEMO_MAX_FRAME);
+    xil_printf("[False Color] %s uygulandi! (%d yildiz overlay)\r\n", names[mode], st_num_stars);
+}
+
+/* ------------------------------------------------------------ */
 
 /*
  * Overlay'i temizle: mevcut frame'i siyahla doldur veya
@@ -736,6 +854,45 @@ void DemoRun()
 		case 't':
 			StarTracker_ChangeThreshold();
 			break;
+		/* ========== FALSE COLOR LUT ========== */
+		case 'h':
+			StarTracker_ApplyLUT(1); /* Heatmap */
+			break;
+		case 'j':
+			StarTracker_ApplyLUT(2); /* Rainbow */
+			break;
+		case 'k':
+			StarTracker_ApplyLUT(3); /* Inverted */
+			break;
+		case 'l':
+			StarTracker_ApplyLUT(0); /* Grayscale (orijinal) */
+			break;
+		case 'x':
+			/* Kanal testi: ekranin 1/3'u byte0, 1/3'u byte1, 1/3'u byte2 */
+			{
+				u8 *tf = pFrames[dispCtrl.curFrame];
+				u32 tw = dispCtrl.vMode.width;
+				u32 th = dispCtrl.vMode.height;
+				u32 ts = DEMO_STRIDE;
+				u32 tr, tc;
+				u32 tls = 0;
+				for (tr = 0; tr < th; tr++) {
+					for (tc = 0; tc < tw; tc++) {
+						u32 ti = tls + tc * 3;
+						if (tc < tw/3) {
+							tf[ti]=255; tf[ti+1]=0; tf[ti+2]=0;
+						} else if (tc < 2*tw/3) {
+							tf[ti]=0; tf[ti+1]=255; tf[ti+2]=0;
+						} else {
+							tf[ti]=0; tf[ti+1]=0; tf[ti+2]=255;
+						}
+					}
+					tls += ts;
+				}
+				Xil_DCacheFlushRange((unsigned int)tf, DEMO_MAX_FRAME);
+				xil_printf("\r\nKanal testi: SOL=byte0, ORTA=byte1, SAG=byte2\r\n");
+			}
+			break;
 		/* ============================================ */
 
 		case 'q':
@@ -788,6 +945,13 @@ void DemoPrintMenu()
 	xil_printf("9 - Run Star Tracker (detect + overlay)\n\r");
 	xil_printf("0 - Clear Overlay (reset to color bars)\n\r");
 	xil_printf("t - Change Threshold (current: %d)\n\r", st_threshold);
+	xil_printf("\n\r");
+	xil_printf("--- False Color ---\n\r");
+	xil_printf("h - Heatmap\n\r");
+	xil_printf("j - Rainbow\n\r");
+	xil_printf("k - Inverted\n\r");
+	xil_printf("l - Grayscale (orijinal)\n\r");
+	xil_printf("x - Kanal Testi (hangi byte hangi renk?)\n\r");
 	xil_printf("\n\r");
 	xil_printf("q - Quit\n\r");
 	xil_printf("\n\r");

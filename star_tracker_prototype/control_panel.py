@@ -17,13 +17,16 @@ import serial
 import threading
 import time
 import sys
+import os
+import numpy as np
+from PIL import Image, ImageTk
 
 
 class StarTrackerPanel:
     def __init__(self, root):
         self.root = root
         self.root.title("FPGA HDMI + Star Tracker Kontrol Paneli")
-        self.root.geometry("820x700")
+        self.root.geometry("820x940")
         self.root.resizable(True, True)
         self.root.configure(bg="#0B1D3A")
         self.root.minsize(700, 600)
@@ -36,6 +39,11 @@ class StarTrackerPanel:
         self.threshold_var = tk.IntVar(value=50)
         self.stars_detected = tk.StringVar(value="0")
         self.resolution_var = tk.StringVar(value="640x480")
+
+        self.current_lut = tk.StringVar(value="Grayscale")
+        self.star_img_tk = None  # PhotoImage referansını tutmak için
+        self.last_stars = []     # Son tespit edilen yıldızlar
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -162,13 +170,261 @@ class StarTrackerPanel:
                 f"Pattern: {names.get(pattern_id, '?')}"))
         self._run(task)
 
-    def _cmd_invert(self):
+    # ── False Color LUT ──
+
+    def _build_lut(self, name):
+        """256 elemanlı LUT tablosu oluştur: her eleman (R,G,B) tuple."""
+        lut = np.zeros((256, 3), dtype=np.uint8)
+        for i in range(256):
+            t = i / 255.0
+            if name == "Grayscale":
+                lut[i] = [i, i, i]
+            elif name == "Heatmap":
+                # siyah → kırmızı → sarı → beyaz
+                if t < 0.33:
+                    s = t / 0.33
+                    lut[i] = [int(255 * s), 0, 0]
+                elif t < 0.66:
+                    s = (t - 0.33) / 0.33
+                    lut[i] = [255, int(255 * s), 0]
+                else:
+                    s = (t - 0.66) / 0.34
+                    lut[i] = [255, 255, int(255 * s)]
+            elif name == "Rainbow":
+                # mavi → cyan → yeşil → sarı → kırmızı
+                if t < 0.25:
+                    s = t / 0.25
+                    lut[i] = [0, int(255 * s), 255]
+                elif t < 0.5:
+                    s = (t - 0.25) / 0.25
+                    lut[i] = [0, 255, int(255 * (1 - s))]
+                elif t < 0.75:
+                    s = (t - 0.5) / 0.25
+                    lut[i] = [int(255 * s), 255, 0]
+                else:
+                    s = (t - 0.75) / 0.25
+                    lut[i] = [255, int(255 * (1 - s)), 0]
+            elif name == "Inverted":
+                v = 255 - i
+                lut[i] = [v, v, v]
+        return lut
+
+    def _apply_lut_to_canvas(self, lut_name=None):
+        """Starfield preview görüntüsüne LUT uygulayıp canvas'ta göster."""
+        if lut_name:
+            self.current_lut.set(lut_name)
+        else:
+            lut_name = self.current_lut.get()
+
+        # Preview PNG'yi yükle
+        preview_path = os.path.join(self.script_dir, "starfield_preview.png")
+        if not os.path.exists(preview_path):
+            self._log_append("starfield_preview.png bulunamadi!\n")
+            return
+
+        gray = np.array(Image.open(preview_path).convert('L'))
+
+        # LUT uygula
+        lut = self._build_lut(lut_name)
+        h, w = gray.shape
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        rgb[..., 0] = lut[gray, 0]
+        rgb[..., 1] = lut[gray, 1]
+        rgb[..., 2] = lut[gray, 2]
+
+        # Canvas boyutuna küçült
+        canvas = self.star_canvas
+        canvas.update_idletasks()
+        cw = canvas.winfo_width() or 380
+        ch = canvas.winfo_height() or 220
+
+        img = Image.fromarray(rgb)
+        # En-boy oranını koru
+        scale = min(cw / w, ch / h)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img = img.resize((new_w, new_h), Image.NEAREST)
+
+        self.star_img_tk = ImageTk.PhotoImage(img)
+
+        canvas.delete("all")
+        ox = (cw - new_w) // 2
+        oy = (ch - new_h) // 2
+        canvas.create_image(ox, oy, anchor="nw", image=self.star_img_tk)
+
+        # Aktif LUT adını göster
+        canvas.create_text(ox + 5, oy + 5, anchor="nw", text=lut_name,
+                           fill="#FFD700", font=("Segoe UI", 9, "bold"))
+
+        # Üzerine yıldız işaretlerini çiz (varsa)
+        if self.last_stars:
+            self._draw_star_overlay(canvas, ox, oy, new_w, new_h, w, h)
+
+        self.root.after(0, lambda: self.status_text.set(f"False Color: {lut_name}"))
+
+    def _draw_star_overlay(self, canvas, ox, oy, disp_w, disp_h, img_w, img_h):
+        """Yıldız işaretlerini LUT görüntüsünün üzerine çiz."""
+        res = self.resolution_var.get()
+        if '1920' in res or '1080' in res:
+            src_w, src_h = 1920, 1080
+        elif '1280' in res:
+            src_w, src_h = 1280, 720 if '720' in res else 1024
+        elif '800' in res:
+            src_w, src_h = 800, 600
+        else:
+            src_w, src_h = 640, 480
+
+        sx = disp_w / src_w
+        sy = disp_h / src_h
+
+        for sid, x, y, brightness, pixels, peak in self.last_stars:
+            cx = ox + x * sx
+            cy = oy + y * sy
+            r = max(4, min(10, pixels * 0.5))
+            # İnce crosshair
+            canvas.create_line(cx - r - 2, cy, cx + r + 2, cy,
+                               fill="#FF4444", width=1)
+            canvas.create_line(cx, cy - r - 2, cx, cy + r + 2,
+                               fill="#FF4444", width=1)
+            canvas.create_text(cx + r + 4, cy - 4, anchor="w", text=str(sid),
+                               fill="#FFDD44", font=("Consolas", 7))
+
+    # ── Monitöre False Color (UART komutu) ──
+
+    def _cmd_apply_lut_to_monitor(self, lut_name):
+        """Firmware'e UART komutu göndererek monitörde false color uygula."""
+        uart_cmds = {
+            "Heatmap": 'h',
+            "Rainbow": 'j',
+            "Inverted": 'k',
+            "Grayscale": 'l',
+        }
+        cmd = uart_cmds.get(lut_name)
+        if not cmd:
+            return
+
         def task():
-            self._log_append("Renk inversiyonu...\n")
-            resp = self._send('7', wait=5)
+            # Canvas'ı da güncelle
+            self.root.after(0, lambda: self._apply_lut_to_canvas(lut_name))
+
+            self._log_append(f"\n[False Color] {lut_name} uygulanıyor...\n")
+            self.root.after(0, lambda: self.status_text.set(
+                f"False Color: {lut_name} uygulanıyor..."))
+
+            resp = self._send(cmd, wait=15)
             self._log_append(resp)
-            self.root.after(0, lambda: self.status_text.set("Renk terslendi"))
+
+            if 'uygulandi' in resp or 'OK' in resp:
+                self.root.after(0, lambda: self.status_text.set(
+                    f"Monitorde: {lut_name}"))
+            else:
+                self.root.after(0, lambda: self.status_text.set(
+                    f"False Color: {lut_name}"))
+
         self._run(task)
+
+    # ── Yıldız Haritası ──
+
+    def _draw_star_map(self, results_text):
+        """UART sonuçlarından yıldızları parse edip canvas'a çiz."""
+        stars = []
+        for line in results_text.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('ID,') or line.startswith('=') or line.startswith('-'):
+                continue
+            parts = line.split(',')
+            if len(parts) == 6:
+                try:
+                    sid = int(parts[0])
+                    x = float(parts[1])
+                    y = float(parts[2])
+                    brightness = int(parts[3])
+                    pixels = int(parts[4])
+                    peak = int(parts[5])
+                    stars.append((sid, x, y, brightness, pixels, peak))
+                except ValueError:
+                    continue
+
+        if not stars:
+            return
+
+        self.last_stars = stars
+
+        # Eğer bir LUT aktifse, LUT görüntüsü üzerine overlay çiz
+        preview_path = os.path.join(self.script_dir, "starfield_preview.png")
+        if os.path.exists(preview_path) and self.current_lut.get() != "Grayscale":
+            self._apply_lut_to_canvas()
+            return
+
+        canvas = self.star_canvas
+        canvas.delete("all")
+
+        cw = canvas.winfo_width() or 380
+        ch = canvas.winfo_height() or 200
+
+        # Çözünürlük bilgisi
+        res = self.resolution_var.get()
+        if '1920' in res or '1080' in res:
+            img_w, img_h = 1920, 1080
+        elif '1280' in res:
+            img_w, img_h = 1280, 720 if '720' in res else 1024
+        elif '800' in res:
+            img_w, img_h = 800, 600
+        else:
+            img_w, img_h = 640, 480
+
+        sx = cw / img_w
+        sy = ch / img_h
+        scale = min(sx, sy)
+        ox = (cw - img_w * scale) / 2
+        oy = (ch - img_h * scale) / 2
+
+        # Arka plan çerçevesi
+        canvas.create_rectangle(ox, oy, ox + img_w * scale, oy + img_h * scale,
+                                outline="#1E3A5F", width=1)
+
+        # Parlaklık aralığını bul
+        brights = [s[3] for s in stars]
+        min_b = min(brights)
+        max_b = max(brights)
+        range_b = max_b - min_b if max_b != min_b else 1
+
+        for sid, x, y, brightness, pixels, peak in stars:
+            cx = ox + x * scale
+            cy = oy + y * scale
+            t = (brightness - min_b) / range_b
+
+            # Renk: mavi(düşük) → yeşil(orta) → kırmızı(yüksek)
+            if t < 0.5:
+                t2 = t * 2
+                r = 0
+                g = int(255 * t2)
+                b = int(255 * (1 - t2))
+            else:
+                t2 = (t - 0.5) * 2
+                r = int(255 * t2)
+                g = int(255 * (1 - t2))
+                b = 0
+
+            color = f"#{r:02x}{g:02x}{b:02x}"
+            radius = max(3, min(8, pixels * 0.4))
+
+            canvas.create_oval(cx - radius, cy - radius,
+                               cx + radius, cy + radius,
+                               fill=color, outline="white", width=1)
+            canvas.create_text(cx, cy - radius - 8, text=str(sid),
+                               fill="#AAAAAA", font=("Consolas", 7))
+
+        # Lejant
+        lx = ox + 6
+        ly = oy + img_h * scale - 18
+        for i, (label, col) in enumerate([("Dusuk", "#0000FF"),
+                                           ("Orta", "#00FF00"),
+                                           ("Yuksek", "#FF0000")]):
+            px = lx + i * 70
+            canvas.create_oval(px, ly, px + 8, ly + 8, fill=col, outline="white")
+            canvas.create_text(px + 14, ly + 4, text=label, anchor="w",
+                               fill="#9DB5D8", font=("Segoe UI", 7))
 
     def _cmd_scale(self):
         def task():
@@ -208,6 +464,8 @@ class StarTrackerPanel:
                         f"Star Tracker: {n} yildiz tespit edildi"))
                 except:
                     pass
+                # Yıldız haritasını çiz
+                self.root.after(100, lambda r=resp: self._draw_star_map(r))
             else:
                 self.root.after(0, lambda: self.status_text.set(
                     "Star Tracker tamamlandi"))
@@ -396,6 +654,52 @@ class StarTrackerPanel:
         btn_t_up.pack(side="left", padx=2)
         self.all_buttons.append(btn_t_up)
 
+        # ══════════════ YILDIZ HARİTASI + FALSE COLOR ══════════════
+        map_frame = ttk.LabelFrame(main, text="Yildiz Haritasi / False Color", padding=4)
+        map_frame.pack(fill="x", pady=(0, 8))
+
+        # LUT önizleme butonları
+        lut_row1 = ttk.Frame(map_frame)
+        lut_row1.pack(fill="x", pady=(0, 2))
+
+        ttk.Label(lut_row1, text="Onizleme:",
+                  style="Section.TLabel").pack(side="left", padx=(0, 8))
+
+        for lut_name in ["Grayscale", "Heatmap", "Rainbow", "Inverted"]:
+            btn = ttk.Button(lut_row1, text=lut_name, style="Small.TButton",
+                             command=lambda n=lut_name: self._apply_lut_to_canvas(n))
+            btn.pack(side="left", padx=2)
+            self.all_buttons.append(btn)
+
+        # Monitöre yansıtma butonları
+        lut_row2 = ttk.Frame(map_frame)
+        lut_row2.pack(fill="x", pady=(2, 4))
+
+        ttk.Label(lut_row2, text="Monitore Yansit:",
+                  style="Section.TLabel").pack(side="left", padx=(0, 8))
+
+        for lut_name in ["Grayscale", "Heatmap", "Rainbow", "Inverted"]:
+            btn = ttk.Button(lut_row2, text=lut_name, style="Small.TButton",
+                             command=lambda n=lut_name: self._cmd_apply_lut_to_monitor(n))
+            btn.pack(side="left", padx=2)
+            self.all_buttons.append(btn)
+
+        btn_chtest = ttk.Button(lut_row2, text="Kanal Test (x)", style="Small.TButton",
+                                command=lambda: self._run(lambda: (
+                                    self._log_append("Kanal testi: SOL=byte0, ORTA=byte1, SAG=byte2\n"),
+                                    self._send('x', wait=3),
+                                    self.root.after(0, lambda: self.status_text.set("Kanal testi aktif"))
+                                )))
+        btn_chtest.pack(side="left", padx=2)
+        self.all_buttons.append(btn_chtest)
+
+        self.star_canvas = tk.Canvas(map_frame, bg="#050a14", height=220,
+                                     highlightthickness=0)
+        self.star_canvas.pack(fill="x", expand=True)
+        self.star_canvas.create_text(190, 110, text="Star Tracker calistirin veya\nrenk haritasi secin...",
+                                     fill="#334466", font=("Segoe UI", 10),
+                                     justify="center")
+
         # ══════════════ DISPLAY / VIDEO ══════════════
         dv_frame = ttk.LabelFrame(main, text="Display / Video", padding=8)
         dv_frame.pack(fill="x", pady=(0, 8))
@@ -425,7 +729,6 @@ class StarTrackerPanel:
             ("Stream Toggle (5)", self._cmd_stream_toggle),
             ("Blended Pattern (3)", lambda: self._cmd_test_pattern('3')),
             ("Color Bar (4)", lambda: self._cmd_test_pattern('4')),
-            ("Renk Ters (7)", self._cmd_invert),
             ("Olcekle (8)", self._cmd_scale),
             ("Display FB (2)", lambda: self._cmd_change_fb('2', 'Display')),
             ("Video FB (6)", lambda: self._cmd_change_fb('6', 'Video')),

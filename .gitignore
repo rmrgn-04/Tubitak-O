@@ -27,3 +27,7 @@ vivado*.jou
 
 # Executables
 putty.exe
+
+# Large generated binary files (regenerate with generate_starfield.py)
+star_tracker_prototype/starfield_1080p.bin
+star_tracker_prototype/starfield_640x480.bin
